@@ -1,306 +1,40 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Webcam VO Demo</title>
-  <style>
-    body{margin:0;font-family:system-ui;background:#111;color:#eee}
-    header{padding:10px 14px;background:#1a1a1a;border-bottom:1px solid #2a2a2a}
-    .wrap{display:grid;grid-template-columns:1fr 420px;gap:12px;padding:12px}
-    .card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;padding:10px}
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    button{background:#2a2a2a;color:#eee;border:1px solid #3a3a3a;border-radius:10px;padding:8px 10px;cursor:pointer}
-    button:hover{background:#333}
-    canvas,video{width:100%;height:auto;border-radius:10px;background:#000}
-    .status{font-size:12px;opacity:.9;white-space:pre-wrap;line-height:1.35}
-  </style>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
 <header>
-  <div><b>Webcam VO (SLAM-ish)</b> 軌跡 + 簡易マップ</div>
-  <div style="font-size:12px;opacity:.8">※ https か localhost で開いてください（file直開きNG）</div>
+  <div><b>Webcam VO (SLAM-ish)</b> Monocular visual odometry demo</div>
+  <div class="hint">Use `https` or `http://localhost` (`file://` is not supported for camera access).</div>
 </header>
 
 <div class="wrap">
   <div class="card">
     <div class="row">
-      <button id="btnStart" disabled>Start (カメラ開始)</button>
+      <button id="btnStart" disabled>Start (Allow camera)</button>
       <button id="btnStop" disabled>Stop</button>
       <button id="btnReset" disabled>Reset</button>
     </div>
-    <div style="margin-top:10px;">
+    <div class="block">
       <video id="video" playsinline autoplay muted></video>
     </div>
-    <div style="margin-top:10px;">
+    <div class="block">
       <canvas id="view" width="960" height="540"></canvas>
     </div>
-    <div class="status" id="status">OpenCV.js loading...</div>
+    <div class="status" id="status">Loading OpenCV.js...</div>
   </div>
 
   <div class="card">
-    <div style="margin-bottom:8px;"><b>Trajectory / Simple Map</b></div>
+    <div class="card-title">Trajectory / Simple Map</div>
     <canvas id="map" width="400" height="400"></canvas>
   </div>
 </div>
 
-<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
-<script>
-(() => {
-  const btnStart = document.getElementById('btnStart');
-  const btnStop  = document.getElementById('btnStop');
-  const btnReset = document.getElementById('btnReset');
-  const statusEl = document.getElementById('status');
-  const video = document.getElementById('video');
-  const viewC = document.getElementById('view');
-  const viewG = viewC.getContext('2d');
-  const mapC  = document.getElementById('map');
-  const mapG  = mapC.getContext('2d');
-
-  const traj=[], mapPts=[];
-  let stream=null, running=false, rafId=null, cvReady=false;
-  let cap=null, matRGBA=null, matGray=null, prevGray=null;
-  let orb=null, bf=null, prevKp=null, prevDesc=null;
-  let Rw=null, pw=null;
-
-  function log(lines){ statusEl.textContent = lines.join('\n'); }
-
-  function resetMap(){
-    traj.length=0; mapPts.length=0;
-    if (Rw) Rw.delete(); if (pw) pw.delete();
-    Rw = cv.Mat.eye(3,3,cv.CV_64F);
-    pw = new cv.Mat(3,1,cv.CV_64F);
-    pw.data64F[0]=0; pw.data64F[1]=0; pw.data64F[2]=0;
-    traj.push({x:0,z:0});
-    drawMap();
-  }
-
-  function drawMap(){
-    mapG.clearRect(0,0,mapC.width,mapC.height);
-    mapG.fillStyle='#0b0b0b'; mapG.fillRect(0,0,mapC.width,mapC.height);
-
-    mapG.strokeStyle='rgba(255,255,255,0.08)';
-    mapG.beginPath();
-    mapG.moveTo(mapC.width/2,0); mapG.lineTo(mapC.width/2,mapC.height);
-    mapG.moveTo(0,mapC.height/2); mapG.lineTo(mapC.width,mapC.height/2);
-    mapG.stroke();
-
-    // scale
-    let minX=0,maxX=0,minZ=0,maxZ=0;
-    for(const p of traj){ minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x); minZ=Math.min(minZ,p.z); maxZ=Math.max(maxZ,p.z); }
-    const span=Math.max(1e-6, maxX-minX, maxZ-minZ);
-    const scale=(mapC.width*0.7)/span;
-    const cx=mapC.width/2, cz=mapC.height/2;
-
-    // points
-    mapG.fillStyle='rgba(200,200,200,0.45)';
-    for(let i=0;i<mapPts.length;i+=Math.max(1,Math.floor(mapPts.length/1200))){
-      const p=mapPts[i];
-      mapG.fillRect(cx+p.x*scale, cz+p.z*scale, 1,1);
-    }
-
-    // trajectory
-    mapG.strokeStyle='rgba(120,170,255,0.95)'; mapG.lineWidth=2;
-    mapG.beginPath();
-    traj.forEach((p,i)=> {
-      const x=cx+p.x*scale, y=cz+p.z*scale;
-      if(i===0) mapG.moveTo(x,y); else mapG.lineTo(x,y);
-    });
-    mapG.stroke();
-  }
-
-  function makeK(w,h){
-    const fx=0.9*w, fy=0.9*w, cx=w/2, cy=h/2;
-    return cv.matFromArray(3,3,cv.CV_64F,[fx,0,cx, 0,fy,cy, 0,0,1]);
-  }
-
-  function matMul3x3(A,B){
-    const C=new cv.Mat(3,3,cv.CV_64F);
-    for(let r=0;r<3;r++)for(let c=0;c<3;c++){
-      let s=0; for(let k=0;k<3;k++) s+=A.data64F[r*3+k]*B.data64F[k*3+c];
-      C.data64F[r*3+c]=s;
-    }
-    return C;
-  }
-  function matMul3x3Vec(A,v){
-    const o=new cv.Mat(3,1,cv.CV_64F);
-    for(let r=0;r<3;r++){
-      o.data64F[r]=A.data64F[r*3+0]*v.data64F[0]+A.data64F[r*3+1]*v.data64F[1]+A.data64F[r*3+2]*v.data64F[2];
-    }
-    return o;
-  }
-  function matAdd3(a,b){
-    const o=new cv.Mat(3,1,cv.CV_64F);
-    o.data64F[0]=a.data64F[0]+b.data64F[0];
-    o.data64F[1]=a.data64F[1]+b.data64F[1];
-    o.data64F[2]=a.data64F[2]+b.data64F[2];
-    return o;
-  }
-  function matScale3(v,s){
-    const o=new cv.Mat(3,1,cv.CV_64F);
-    o.data64F[0]=v.data64F[0]*s; o.data64F[1]=v.data64F[1]*s; o.data64F[2]=v.data64F[2]*s;
-    return o;
-  }
-
-  async function initCamera(){
-    if (!window.isSecureContext){
-      throw new Error("This page is not a secure context. Use https or http://localhost .");
-    }
-    stream = await navigator.mediaDevices.getUserMedia({ video:{width:{ideal:960},height:{ideal:540}}, audio:false });
-    video.srcObject = stream;
-    await video.play();
-
-    const w=video.videoWidth||960, h=video.videoHeight||540;
-    viewC.width=w; viewC.height=h;
-
-    cap = new cv.VideoCapture(video);
-    matRGBA = new cv.Mat(h,w,cv.CV_8UC4);
-    matGray = new cv.Mat(h,w,cv.CV_8UC1);
-
-    orb = new cv.ORB(1200, 1.2, 8, 31, 0, 2, cv.ORB_HARRIS_SCORE, 31, 20);
-    bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
-
-    log([`Camera OK: ${w}x${h}`, "Press Start again if needed."]);
-  }
-
-  function stop(){
-    running=false;
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId=null;
-    btnStop.disabled=true;
-    btnStart.disabled=false;
-  }
-
-  function cleanup(){
-    stop();
-    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
-  }
-
-  function loop(){
-    if(!running) return;
-    rafId=requestAnimationFrame(loop);
-
-    cap.read(matRGBA);
-    cv.cvtColor(matRGBA, matGray, cv.COLOR_RGBA2GRAY);
-
-    // show video frame (if canvas is black, this helps diagnosis)
-    viewG.drawImage(video, 0, 0, viewC.width, viewC.height);
-
-    const kp=new cv.KeyPointVector();
-    const desc=new cv.Mat();
-    orb.detectAndCompute(matGray, new cv.Mat(), kp, desc);
-
-    // overlay some features
-    viewG.fillStyle='rgba(120,255,160,0.9)';
-    for(let i=0;i<kp.size();i+=Math.max(1,Math.floor(kp.size()/800))){
-      const p=kp.get(i).pt; viewG.fillRect(p.x-1,p.y-1,2,2);
-    }
-
-    let msg=[`Features: ${kp.size()}`, `Traj: ${traj.length}`, `Map: ${mapPts.length}`];
-
-    if(prevGray && prevDesc && !prevDesc.empty() && !desc.empty()){
-      const matches=new cv.DMatchVector();
-      bf.match(prevDesc, desc, matches);
-
-      const arr=[];
-      for(let i=0;i<matches.size();i++){ const m=matches.get(i); arr.push({q:m.queryIdx,t:m.trainIdx,d:m.distance}); }
-      arr.sort((a,b)=>a.d-b.d);
-      const Kkeep=Math.min(200, arr.length);
-
-      if(Kkeep>=80){
-        const pts1=[], pts2=[];
-        for(let i=0;i<Kkeep;i++){
-          const m=arr[i];
-          const p1=prevKp.get(m.q).pt, p2=kp.get(m.t).pt;
-          pts1.push(p1.x,p1.y); pts2.push(p2.x,p2.y);
-        }
-        const m1=cv.matFromArray(Kkeep,1,cv.CV_32FC2,pts1);
-        const m2=cv.matFromArray(Kkeep,1,cv.CV_32FC2,pts2);
-        const Kmat=makeK(viewC.width, viewC.height);
-        const mask=new cv.Mat();
-        const E=cv.findEssentialMat(m1,m2,Kmat,cv.RANSAC,0.999,1.0,mask);
-
-        if(!E.empty()){
-          const R=new cv.Mat(), t=new cv.Mat();
-          const inl=cv.recoverPose(E,m1,m2,Kmat,R,t,mask);
-
-          const stepScale=0.08;
-          const t64=new cv.Mat(3,1,cv.CV_64F);
-          t64.data64F[0]=t.data32F[0]; t64.data64F[1]=t.data32F[1]; t64.data64F[2]=t.data32F[2];
-
-          const RwNew=matMul3x3(Rw,R);
-          const dp=matMul3x3Vec(Rw, matScale3(t64,stepScale));
-          const pwNew=matAdd3(pw,dp);
-
-          Rw.delete(); pw.delete();
-          Rw=RwNew; pw=pwNew;
-
-          traj.push({x:pw.data64F[0], z:pw.data64F[2]});
-          for(let i=0;i<Kkeep;i+=Math.max(2,Math.floor(Kkeep/120))){
-            if(mask.dataU8[i]===0) continue;
-            const x=m2.data32F[i*2];
-            const nx=(x-viewC.width/2)/(viewC.width/2);
-            mapPts.push({x:pw.data64F[0]+nx*0.25, z:pw.data64F[2]+0.25});
-          }
-          if(mapPts.length>3000) mapPts.splice(0,mapPts.length-3000);
-          drawMap();
-
-          msg.push(`Inliers: ${inl}`);
-          R.delete(); t.delete(); t64.delete(); dp.delete();
-        } else {
-          msg.push("Pose: failed (E empty)");
-        }
-        E.delete(); mask.delete(); m1.delete(); m2.delete(); Kmat.delete();
-      } else {
-        msg.push(`Pose: not enough matches (${Kkeep})`);
-      }
-      matches.delete();
-    } else {
-      msg.push("Pose: waiting prev frame...");
-    }
-    log(msg);
-
-    if(prevGray) prevGray.delete();
-    prevGray=matGray.clone();
-    if(prevKp) prevKp.delete();
-    prevKp=kp;
-    if(prevDesc) prevDesc.delete();
-    prevDesc=desc;
-  }
-
-  async function start(){
-    if(!cvReady){ log(["OpenCV not ready."]); return; }
-    try{
-      if(!stream){
-        log(["Requesting camera permission..."]);
-        await initCamera();
-      }
-      if(!Rw || !pw) resetMap();
-      running=true;
-      btnStart.disabled=true;
-      btnStop.disabled=false;
-      btnReset.disabled=false;
-      loop();
-    }catch(e){
-      log(["Start failed:", String(e)]);
-      running=false;
-      btnStart.disabled=false;
-      btnStop.disabled=true;
-    }
-  }
-
-  btnStart.addEventListener('click', start);
-  btnStop.addEventListener('click', stop);
-  btnReset.addEventListener('click', resetMap);
-  window.addEventListener('beforeunload', cleanup);
-
-  window.Module = window.Module || {};
-  window.Module.onRuntimeInitialized = () => {
-    cvReady=true;
-    log(["OpenCV.js loaded.", "Click Start to request camera."]);
-    btnStart.disabled=false;
-  };
-})();
-</script>
+<script type="module" src="js/app.js"></script>
 </body>
 </html>
