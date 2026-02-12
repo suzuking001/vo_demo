@@ -10,12 +10,26 @@ const btnReset = document.getElementById("btnReset");
 const statusEl = document.getElementById("status");
 const video = document.getElementById("video");
 const viewC = document.getElementById("view");
-const viewG = viewC.getContext("2d");
+const viewG = viewC.getContext("2d", { willReadFrequently: true });
 const mapC = document.getElementById("map");
+const btnMapMode = document.getElementById("btnMapMode");
+
+window.__voAppLoaded = true;
+
+if (!mapC) {
+  statusEl.textContent = "Map canvas not found (#map).";
+  throw new Error("Map canvas not found (#map).");
+}
 
 const traj = [];
 const mapPts = [];
-const drawMap = createMapRenderer(mapC);
+const mapView = createMapRenderer(mapC);
+let mapDrawCount = 0;
+
+function drawMapSafe() {
+  mapView.drawMap(traj, mapPts);
+  mapDrawCount += 1;
+}
 
 let running = false;
 let rafId = null;
@@ -29,9 +43,17 @@ let emptyMask = null;
 
 let Rw = null;
 let pw = null;
+let capabilityLogged = false;
 
 function log(lines) {
   statusEl.textContent = lines.join("\n");
+}
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
 const camera = createCameraPipeline({
@@ -58,8 +80,8 @@ function resetMap() {
   pw.data64F[0] = 0;
   pw.data64F[1] = 0;
   pw.data64F[2] = 0;
-  traj.push({ x: 0, z: 0 });
-  drawMap(traj, mapPts);
+  traj.push({ x: 0, y: 0, z: 0 });
+  drawMapSafe();
 }
 
 function stop() {
@@ -132,9 +154,15 @@ function estimatePose(kp, desc, msg) {
   const mask = new cv.Mat();
 
   let E = null;
-  if (typeof cv.findEssentialMat === "function") {
+  const hasEssential = typeof cv.findEssentialMat === "function";
+  const hasFundamental = typeof cv.findFundamentalMat === "function";
+  if (!capabilityLogged) {
+    capabilityLogged = true;
+    msg.push(`Calib3d: ${hasEssential ? "essential" : hasFundamental ? "fundamental" : "missing"}`);
+  }
+  if (hasEssential) {
     E = cv.findEssentialMat(m1, m2, Kmat, cv.RANSAC, 0.999, 1.5, mask);
-  } else if (typeof cv.findFundamentalMat === "function") {
+  } else if (hasFundamental) {
     const F = cv.findFundamentalMat(m1, m2, cv.FM_RANSAC, 1.5, 0.999, mask);
     if (!F.empty()) {
       E = new cv.Mat();
@@ -167,6 +195,7 @@ function estimatePose(kp, desc, msg) {
       const dp = matMul3x3Vec(Rw, scaledT);
       const pwNew = matAdd3(pw, dp);
       const px = pwNew.data64F[0];
+      const py = pwNew.data64F[1];
       const pz = pwNew.data64F[2];
 
       if (!Number.isFinite(px) || !Number.isFinite(pz)) {
@@ -179,18 +208,18 @@ function estimatePose(kp, desc, msg) {
         Rw = RwNew;
         pw = pwNew;
 
-        traj.push({ x: px, z: pz });
+        traj.push({ x: px, y: py, z: pz });
         const mapStride = Math.max(2, Math.floor(Kkeep / 120));
         for (let i = 0; i < Kkeep; i += mapStride) {
           if (mask.dataU8[i] === 0) continue;
           const x = m2.data32F[i * 2];
           const nx = (x - viewC.width / 2) / (viewC.width / 2);
-          mapPts.push({ x: px + nx * 0.25, z: pz + 0.25 });
+          mapPts.push({ x: px + nx * 0.25, y: 0, z: pz + 0.25 });
         }
         if (mapPts.length > 3000) {
           mapPts.splice(0, mapPts.length - 3000);
         }
-        drawMap(traj, mapPts);
+        drawMapSafe();
       }
 
       t64.delete();
@@ -200,7 +229,35 @@ function estimatePose(kp, desc, msg) {
     R.delete();
     t.delete();
   } else {
-    msg.push("Pose: failed (E unavailable)");
+    const dxs = [];
+    const dys = [];
+    for (let i = 0; i < Kkeep; i++) {
+      const dx = pts2[i * 2] - pts1[i * 2];
+      const dy = pts2[i * 2 + 1] - pts1[i * 2 + 1];
+      dxs.push(dx);
+      dys.push(dy);
+    }
+    const mdx = median(dxs);
+    const mdy = median(dys);
+    if (mdx === null || mdy === null || !Number.isFinite(mdx) || !Number.isFinite(mdy)) {
+      msg.push("Pose: failed (E unavailable)");
+    } else {
+      const pixelShift = Math.abs(mdx) + Math.abs(mdy);
+      if (pixelShift < 0.5) {
+        msg.push("Pose: motion too small");
+      } else {
+        const stepScale = 0.002;
+        if (!pw) {
+          msg.push("Pose: no world state");
+        } else {
+          pw.data64F[0] += -mdx * stepScale;
+          pw.data64F[2] += -mdy * stepScale;
+          traj.push({ x: pw.data64F[0], y: pw.data64F[1], z: pw.data64F[2] });
+          drawMapSafe();
+          msg.push("Pose: 2D flow fallback");
+        }
+      }
+    }
   }
 
   if (E) E.delete();
@@ -232,7 +289,12 @@ function loop() {
 
     overlayFeatures(kp);
 
-    const msg = [`Features: ${kp.size()}`, `Traj: ${traj.length}`, `Map: ${mapPts.length}`];
+    const msg = [
+      `Features: ${kp.size()}`,
+      `Traj: ${traj.length}`,
+      `Map: ${mapPts.length}`,
+      `Map size: ${mapC.width}x${mapC.height} (draw ${mapDrawCount})`
+    ];
 
     if (prevKp && prevDesc && !prevDesc.empty() && !desc.empty()) {
       estimatePose(kp, desc, msg);
@@ -301,16 +363,24 @@ function onCvReady() {
   if (cvReady) return;
   cvReady = true;
   btnStart.disabled = false;
-  drawMap(traj, mapPts);
-  log(["OpenCV.js loaded.", "Click Start to request camera."]);
+  resetMap();
+  const source = window.__opencvJsSource ? `OpenCV.js loaded (${window.__opencvJsSource})` : "OpenCV.js loaded";
+  log([source, "Click Start to request camera."]);
 }
 
 btnStart.addEventListener("click", start);
 btnStop.addEventListener("click", stop);
 btnReset.addEventListener("click", resetMap);
+if (btnMapMode) {
+  btnMapMode.addEventListener("click", () => {
+    const next = mapView.getMode() === "2d" ? "3d" : "2d";
+    mapView.setMode(next);
+    btnMapMode.textContent = `Map: ${next.toUpperCase()}`;
+  });
+}
 window.addEventListener("beforeunload", cleanup);
 
-drawMap(traj, mapPts);
+drawMapSafe();
 loadOpenCv({
   onReady: onCvReady,
   onError: () => log(["Failed to load OpenCV.js.", "Check network connectivity and reload this page."])
