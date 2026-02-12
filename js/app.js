@@ -13,6 +13,8 @@ const viewC = document.getElementById("view");
 const viewG = viewC.getContext("2d", { willReadFrequently: true });
 const mapC = document.getElementById("map");
 const btnMapMode = document.getElementById("btnMapMode");
+const btnMapReset = document.getElementById("btnMapReset");
+const btnMapHeight = document.getElementById("btnMapHeight");
 
 window.__voAppLoaded = true;
 
@@ -31,6 +33,8 @@ function drawMapSafe() {
   mapDrawCount += 1;
 }
 
+mapView.attachControls();
+
 let running = false;
 let rafId = null;
 let cvReady = false;
@@ -44,6 +48,7 @@ let emptyMask = null;
 let Rw = null;
 let pw = null;
 let capabilityLogged = false;
+let poseMode = "init";
 
 function log(lines) {
   statusEl.textContent = lines.join("\n");
@@ -173,6 +178,7 @@ function estimatePose(kp, desc, msg) {
   }
 
   if (E && !E.empty()) {
+    poseMode = "essential";
     const R = new cv.Mat();
     const t = new cv.Mat();
     const inliers = cv.recoverPose(E, m1, m2, Kmat, R, t, mask);
@@ -229,6 +235,7 @@ function estimatePose(kp, desc, msg) {
     R.delete();
     t.delete();
   } else {
+    poseMode = "fallback";
     const dxs = [];
     const dys = [];
     for (let i = 0; i < Kkeep; i++) {
@@ -293,7 +300,8 @@ function loop() {
       `Features: ${kp.size()}`,
       `Traj: ${traj.length}`,
       `Map: ${mapPts.length}`,
-      `Map size: ${mapC.width}x${mapC.height} (draw ${mapDrawCount})`
+      `Map size: ${mapC.width}x${mapC.height} (draw ${mapDrawCount})`,
+      `Pose mode: ${poseMode}`
     ];
 
     if (prevKp && prevDesc && !prevDesc.empty() && !desc.empty()) {
@@ -376,6 +384,19 @@ if (btnMapMode) {
     const next = mapView.getMode() === "2d" ? "3d" : "2d";
     mapView.setMode(next);
     btnMapMode.textContent = `Map: ${next.toUpperCase()}`;
+  });
+}
+if (btnMapReset) {
+  btnMapReset.addEventListener("click", () => {
+    mapView.resetView();
+  });
+}
+if (btnMapHeight) {
+  btnMapHeight.addEventListener("click", () => {
+    const current = mapView.getHeightScale();
+    const next = current < 1.5 ? 2 : current < 3 ? 4 : 1;
+    mapView.setHeightScale(next);
+    btnMapHeight.textContent = `Height x${next}`;
   });
 }
 window.addEventListener("beforeunload", cleanup);
